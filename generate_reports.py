@@ -1,10 +1,22 @@
+# report.py
+#
+# Final report generation script.
+# The answer key file is now OPTIONAL.
+#
+# Usage (with answer key):
+# python report.py "student_data.csv" "answer_key.csv"
+#
+# Usage (without answer key):
+# python report.py "student_data.csv"
+#
+
 import pandas as pd
 import sys
 import os
 from datetime import datetime
-import html  # Per html.escape()
+from html import escape # Used to safely print HTML characters in PDF
 
-# Importiamo i componenti di ReportLab
+# Try to import the reportlab library
 try:
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -12,229 +24,245 @@ try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
 except ImportError:
-    print("Errore: La libreria 'reportlab' non è installata.")
-    print("Per favore, assicurati di essere nell'ambiente virtuale (venv)")
-    print("e di averla installata con: pip install reportlab pandas")
+    print("Error: The 'reportlab' library is not installed.")
+    print("Please activate your virtual environment and run:")
+    print("pip install reportlab")
     sys.exit(1)
 
 # ==========================================================
-#  IMPOSTAZIONI
+#  SCRIPT SETTINGS
 # ==========================================================
-# Colonna per il nome dello studente (e nome file PDF)
-COLONNA_NOME_STUDENTE = "Nome e Cognome"
+# Column names from the student data file
+STUDENT_NAME_COLUMN = "Nome e Cognome"
+POINTS_PREFIX = "Points - "
+CALCULATED_PREFIX = "CALCOLO - " 
+FINAL_SCORE_COLUMN = "Punteggio_Finale_Corretto"
+FINAL_GRADE_COLUMN = "Voto_su_10"
 
-# Prefissi delle colonne che lo script cercherà
-PREFISSO_POINTS = "Points - "
-PREFISSO_CALCOLO = "CALCOLO - " # <-- Importante!
+# Column names from the answer key file
+ANSWER_KEY_QUESTION_COL = "Domanda"
+ANSWER_KEY_ANSWER_COL = "RispostaCorretta"
 
-# Nome della cartella di output
-OUTPUT_FOLDER = "Report_PDF_Studenti"
+# PDF Output settings
+OUTPUT_FOLDER = "Student_Reports_Final"
 # ==========================================================
 
 
-def pulisci_nome_file(nome):
+def load_answer_key(key_file_path):
     """
-    Rimuove caratteri non validi dai nomi dei file.
+    Reads the answer key CSV and returns a dictionary
+    for fast lookup: {question_text: correct_answer_text}
     """
-    return nome.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "").replace("*", "")
+    try:
+        # Use utf-8-sig to handle the BOM from Excel
+        df_key = pd.read_csv(key_file_path, sep=';', encoding='utf-8-sig')
+        
+        if ANSWER_KEY_QUESTION_COL not in df_key.columns or ANSWER_KEY_ANSWER_COL not in df_key.columns:
+            print(f"  > Error: Key file '{key_file_path}' must contain")
+            print(f"  > '{ANSWER_KEY_QUESTION_COL}' and '{ANSWER_KEY_ANSWER_COL}' columns.")
+            return None
+            
+        # Fill empty answers with a placeholder
+        df_key[ANSWER_KEY_ANSWER_COL] = df_key[ANSWER_KEY_ANSWER_COL].fillna(pd.NA)
+        
+        return pd.Series(df_key[ANSWER_KEY_ANSWER_COL].values, 
+                         index=df_key[ANSWER_KEY_QUESTION_COL]).to_dict()
+    except Exception as e:
+        print(f"  > Error reading answer key file '{key_file_path}': {e}")
+        return None
 
-def crea_pdf_studente(percorso_pdf, dati_studente, triplette_domande, stili):
+def find_question_list(df_columns):
     """
-    Crea un singolo file PDF per uno studente.
+    Robustly scans the data columns and identifies the list of questions
+    by finding matching (Question, "Points - " + Question) pairs.
     """
-    doc = SimpleDocTemplate(percorso_pdf, pagesize=A4,
+    questions = []
+    # Create a set of all column names for very fast lookup
+    all_cols_set = set(df_columns)
+    
+    for col_name in df_columns:
+        # A column is a "Question" if its corresponding "Points -" column exists
+        if f"{POINTS_PREFIX}{col_name}" in all_cols_set:
+            
+            # We also check that the column itself is not a special one
+            if not col_name.startswith((POINTS_PREFIX, CALCULATED_PREFIX, "Feedback - ")):
+                 questions.append(col_name)
+                 
+    return questions
+
+
+def create_student_pdf(pdf_path, student_data, question_list, answer_key):
+    """
+    Creates a single PDF file for one student.
+    'answer_key' is a dictionary. If it's empty, correct answers are skipped.
+    """
+    
+    doc = SimpleDocTemplate(pdf_path, pagesize=A4,
                             leftMargin=2*cm, rightMargin=2*cm,
                             topMargin=2*cm, bottomMargin=2*cm)
     story = []
     
-    # --- 1. Titolo del Report ---
-    nome_studente = dati_studente.get(COLONNA_NOME_STUDENTE, "Studente Sconosciuto")
-    story.append(Paragraph(f"Report Test: {html.escape(nome_studente)}", stili['h1']))
-    story.append(Paragraph(f"Data report: {datetime.now().strftime('%d/%m/%Y %H:%M')}", stili['BodyText']))
-    
-    # --- 2. Dati Riepilogo (Punteggio Finale e Voto) ---
-    if "Punteggio_Finale_Corretto" in dati_studente:
-        story.append(Spacer(1, 1 * cm))
-        punti = dati_studente['Punteggio_Finale_Corretto']
-        voto = dati_studente.get('Voto_su_10', 'N/D') # .get() per sicurezza
-        story.append(Paragraph(f"<b>Punteggio Finale (con penalità):</b> {punti}", stili['BodyText']))
-        story.append(Paragraph(f"<b>Voto Finale (su 10):</b> {voto}", stili['BodyText']))
+    # Define text styles
+    styles = getSampleStyleSheet()
+    style_h1 = styles['h1']
+    style_body = styles['BodyText']
+    style_body.fontSize = 11
+    style_body.leading = 14  # Line spacing
 
+    style_question = ParagraphStyle('Question', parent=styles['h3'], fontSize=12, spaceAfter=4)
+    
+    style_correct_answer = ParagraphStyle(
+        'CorrectAnswer',
+        parent=style_body,
+        textColor=colors.HexColor('#228B22'), # ForestGreen
+        fontName='Helvetica-Bold',
+        leftIndent=1*cm,
+        spaceBefore=4
+    )
+
+    # --- 1. PDF Header ---
+    student_name = student_data.get(STUDENT_NAME_COLUMN, "Unknown Student")
+    story.append(Paragraph(f"Test Report: {escape(student_name)}", style_h1))
+    story.append(Paragraph(f"Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}", style_body))
+    
+    # --- 2. Summary Scores ---
+    story.append(Spacer(1, 1 * cm))
+    if FINAL_SCORE_COLUMN in student_data:
+        score = student_data[FINAL_SCORE_COLUMN]
+        grade = student_data.get(FINAL_GRADE_COLUMN, "N/A")
+        story.append(Paragraph(f"<b>Final Calculated Score:</b> {score}", style_body))
+        story.append(Paragraph(f"<b>Final Grade (out of 10):</b> {grade}", style_body))
     story.append(Spacer(1, 1.5 * cm))
 
-    # --- 3. Lista Domande, Risposte e PUNTEGGIO CALCOLATO ---
-    for (col_domanda, col_calcolo) in triplette_domande:
+    # --- 3. List of Questions and Answers ---
+    for question_text in question_list:
         
-        # Prendiamo i dati dalla riga (dati_studente è una Series)
-        testo_domanda = col_domanda
-        risposta_data = dati_studente.get(col_domanda)
-        punti_calcolati = dati_studente.get(col_calcolo) # <-- Prendiamo il punteggio calcolato
-
-        # Formattiamo la risposta se è vuota
-        if pd.isna(risposta_data) or risposta_data == '':
-            testo_risposta = "<i>(Nessuna risposta data)</i>"
+        student_answer = student_data.get(question_text)
+        calc_col_name = f"{CALCULATED_PREFIX}{question_text}"
+        calculated_score = pd.to_numeric(student_data.get(calc_col_name), errors='coerce')
+        
+        if pd.isna(student_answer) or str(student_answer).strip() == '':
+            answer_display = "<i>(No answer given)</i>"
         else:
-            testo_risposta = html.escape(str(risposta_data))
+            answer_display = escape(str(student_answer))
 
-        # --- Logica Punteggio/Errore ---
-        # Decidiamo cosa scrivere e con quale stile
-        if punti_calcolati == 1:
-            testo_punteggio = f"<b>Punteggio: 1 (CORRETTO)</b>"
-            stile_punteggio = stili['PunteggioCorretto']
-        elif punti_calcolati == -0.25:
-            testo_punteggio = f"<b>Punteggio: -0.25 (ERRORE)</b>"
-            stile_punteggio = stili['PunteggioErrore']
-        elif punti_calcolati == 0:
-            testo_punteggio = f"<b>Punteggio: 0 (VUOTA)</b>"
-            stile_punteggio = stili['PunteggioVuoto']
-        else:
-            # Fallback, non dovrebbe succedere
-            testo_punteggio = f"Punti: {punti_calcolati}"
-            stile_punteggio = stili['BodyText']
+        story.append(Paragraph(escape(question_text), style_question))
+        story.append(Paragraph(f"<b>Your Answer:</b> {answer_display}", style_body))
+        story.append(Paragraph(f"<b>Calculated Score:</b> {calculated_score}", style_body))
 
-        # Aggiungiamo gli elementi al PDF
-        story.append(Paragraph(html.escape(testo_domanda), stili['h3'])) # Domanda
-        story.append(Spacer(1, 0.2 * cm))
-        story.append(Paragraph(f"<b>Risposta:</b> {testo_risposta}", stili['BodyText'])) # Risposta
-        story.append(Paragraph(testo_punteggio, stile_punteggio)) # Punteggio calcolato
-        story.append(Spacer(1, 0.8 * cm)) # Spazio tra una domanda e l'altra
+        # --- KEY LOGIC (Handles both requests) ---
+        # If score is less than 1 (wrong) AND the answer_key is not empty
+        if calculated_score < 1 and answer_key:
+            correct_answer = answer_key.get(question_text)
+            
+            # This handles request #2:
+            # If a correct answer was found AND it's not empty
+            if correct_answer and pd.notna(correct_answer):
+                story.append(Paragraph(
+                    f"<b>Correct Answer:</b> {escape(str(correct_answer))}", 
+                    style_correct_answer
+                ))
+            else:
+                # Key exists, but this specific question is missing from it
+                print(f"  > Warning: No key found for question: '{question_text}'")
 
-    # Costruisci il PDF
+        story.append(Spacer(1, 1 * cm)) # Space between questions
+
+    # Build the PDF
     try:
         doc.build(story)
-        print(f"  > OK: Creato {percorso_pdf}")
+        print(f"  > OK: Created {pdf_path}")
     except Exception as e:
-        print(f"  > ERRORE: Impossibile creare PDF per {nome_studente}. Dettagli: {e}")
+        print(f"  > ERROR creating PDF for {student_name}: {e}")
 
 
-def genera_report_da_csv(file_input):
+def main():
     """
-    Funzione principale: legge il CSV e orchestra la creazione dei PDF.
+    Main function to run the report generation.
+    The answer key file (sys.argv[2]) is now optional.
     """
-    
-    # --- 1. Controllo file e cartella output ---
-    if not os.path.exists(file_input):
-        print(f"Errore: Il file '{file_input}' non è stato trovato.")
-        return
-
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    print(f"I PDF verranno salvati nella cartella: '{OUTPUT_FOLDER}'")
-
-    # --- 2. Lettura CSV (con logica robusta) ---
-    try:
-        print(f"Leggendo il file: '{file_input}'...")
-        try:
-            df = pd.read_csv(file_input, sep=';', encoding='utf-8', low_memory=False)
-        except UnicodeDecodeError:
-            print("Lettura in UTF-8 fallita. Tentativo con 'latin-1'...")
-            df = pd.read_csv(file_input, sep=';', encoding='latin-1', low_memory=False)
-        
-        df = df.dropna(axis=1, how='all')
-
-    except Exception as e:
-        print(f"Errore durante la lettura del file: {e}")
-        return
-
-    # --- 3. Definiamo gli Stili PDF ---
-    stili = getSampleStyleSheet()
-    # Aggiungiamo stili personalizzati per i punteggi
-    stili.add(ParagraphStyle(
-        name='PunteggioCorretto',
-        parent=stili['BodyText'],
-        textColor=colors.green
-    ))
-    stili.add(ParagraphStyle(
-        name='PunteggioErrore',
-        parent=stili['BodyText'],
-        textColor=colors.red,
-        fontName='Helvetica-Bold' # Grassetto per evidenziare l'errore
-    ))
-    stili.add(ParagraphStyle(
-        name='PunteggioVuoto',
-        parent=stili['BodyText'],
-        textColor=colors.grey
-    ))
-
-    # --- 4. Trova le coppie Domanda/Calcolo ---
-    print("Scansione delle colonne per trovare le domande e i punteggi calcolati...")
-    # Ora salviamo solo (col_domanda, col_calcolo)
-    domande_da_reportare = []
-    
-    colonne_processate = list(df.columns)
-    num_colonne = len(colonne_processate)
-    i = 0
-    
-    while i < num_colonne:
-        col_domanda = colonne_processate[i]
-        
-        # Costruiamo i nomi attesi delle colonne successive
-        nome_atteso_points = f"{PREFISSO_POINTS}{col_domanda}"
-        nome_atteso_calcolo = f"{PREFISSO_CALCOLO}{col_domanda}"
-        
-        # Cerchiamo la coppia (Domanda, Points) solo per trovare il blocco
-        if (i + 1 < num_colonne and 
-            colonne_processate[i+1] == nome_atteso_points):
-            
-            # Trovata la coppia (Domanda, Points).
-            # Ora controlliamo se esiste la colonna CALCOLO corrispondente
-            if nome_atteso_calcolo in df.columns:
-                # Trovata! Salviamo la coppia (Domanda, Calcolo)
-                domande_da_reportare.append((col_domanda, nome_atteso_calcolo))
-            
-            # Indipendentemente da tutto, saltiamo le colonne
-            # Dobbiamo trovare il modo migliore per saltare...
-            # Saltiamo solo la domanda e points, poi cercheremo feedback e calcolo...
-            # MODO ROBUSTO:
-            i += 1 # Passa alla prossima colonna (Points)
-            while (i < num_colonne and 
-                   (colonne_processate[i].startswith(PREFISSO_POINTS) or
-                    colonne_processate[i].startswith("Feedback - ") or
-                    colonne_processate[i].startswith(PREFISSO_CALCOLO))):
-                i += 1 # Salta tutte le colonne correlate a questa domanda
-        else:
-            i += 1 # Non è una domanda, passa alla prossima colonna
-
-    if not domande_da_reportare:
-        print("\n*** ERRORE ***")
-        print(f"Non sono state trovate colonne '{PREFISSO_CALCOLO}...'.")
-        print("Assicurati di aver eseguito prima lo script 'calcola_voti.py'.")
-        print(f"Esegui questo script sul file risultato (es. '..._completed_with_grades.csv')")
-        return
-        
-    print(f"Trovate {len(domande_da_reportare)} domande da reportare.")
-
-    # --- 5. Genera un PDF per ogni riga (studente) ---
-    print("\nInizio generazione PDF per ogni studente...")
-    
-    if COLONNA_NOME_STUDENTE not in df.columns:
-        print(f"Errore: La colonna '{COLONNA_NOME_STUDENTE}' non è stata trovata nel file.")
-        print("Impossibile nominare i file PDF.")
-        return
-
-    for index, riga_studente in df.iterrows():
-        
-        nome = riga_studente[COLONNA_NOME_STUDENTE]
-        if pd.isna(nome) or nome.strip() == "":
-            nome = f"Studente_ID_{index}"
-        
-        nome_file = f"Report - {pulisci_nome_file(nome)}.pdf"
-        percorso_file_pdf = os.path.join(OUTPUT_FOLDER, nome_file)
-        
-        print(f"Generando report per: {nome}...")
-        
-        # Passiamo anche gli stili
-        crea_pdf_studente(percorso_file_pdf, riga_studente, domande_da_reportare, stili)
-
-    print("\nGenerazione report completata.")
-
-# --- Esecuzione Principale ---
-if __name__ == "__main__":
+    # --- 1. Check arguments ---
     if len(sys.argv) < 2:
-        print("Errore: Devi specificare il nome del file CSV da processare.")
-        print("Uso: python report.py \"nome_file_calcolato.csv\"")
-        print("\n(Suggerimento: Esegui questo script sul file *dopo* aver")
-        print("fatto girare lo script dei calcoli, es:")
-        print("python report.py \"sicurezzaDSA_completed_with_grades.csv\")")
+        print("Error: Missing arguments.")
+        print("Usage: python report.py \"<student_data_file.csv>\" [optional_answer_key.csv]")
+        print("\nExample (with key):")
+        print("python report.py \"grades.csv\" \"key.csv\"")
+        print("\nExample (without key):")
+        print("python report.py \"grades.csv\"")
+        sys.exit(1)
+        
+    student_file = sys.argv[1]
+    key_file = None
+    answer_key_dict = {}  # Default to an empty dictionary
+
+    # --- 2. Check for optional answer key ---
+    if len(sys.argv) >= 3:
+        key_file = sys.argv[2]
+        print(f"Attempting to load answer key from: '{key_file}'")
+        if not os.path.exists(key_file):
+            print(f"  > Warning: Key file not found at '{key_file}'.")
+            print("  > Proceeding without correct answers.")
+        else:
+            answer_key_dict = load_answer_key(key_file)
+            if answer_key_dict is None:
+                print("  > Error loading key file. Proceeding without correct answers.")
+                answer_key_dict = {} # Reset to empty
+            else:
+                print(f"  > Successfully loaded {len(answer_key_dict)} correct answers.")
     else:
-        file_da_processare = sys.argv[1]
-        genera_report_da_csv(file_da_processare)
+        print("No answer key file provided.")
+        print("Generating reports without showing correct answers.")
+
+    # --- 3. Load Student Data ---
+    if not os.path.exists(student_file):
+        print(f"Error: Student data file not found: '{student_file}'")
+        sys.exit(1)
+        
+    print(f"Loading student data from: '{student_file}'")
+    try:
+        df_students = pd.read_csv(student_file, sep=';', encoding='utf-8-sig', low_memory=False)
+    except Exception as e:
+        print(f"Error reading student file: {e}")
+        sys.exit(1)
+    
+    df_students = df_students.dropna(axis=1, how='all')
+
+    # --- 4. Find all questions ---
+    print("Identifying questions from student data...")
+    question_list = find_question_list(df_students.columns)
+    if not question_list:
+        print("Error: No valid question/points pairs found in the student file.")
+        print(f"Check if '{POINTS_PREFIX}' prefix is correct.")
+        sys.exit(1)
+    print(f"Found {len(question_list)} questions to report.")
+    
+    # --- 5. Create Output Folder ---
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    print(f"PDFs will be saved to: '{OUTPUT_FOLDER}'")
+
+    # --- 6. Iterate and Generate PDFs ---
+    if STUDENT_NAME_COLUMN not in df_students.columns:
+        print(f"Error: Student name column '{STUDENT_NAME_COLUMN}' not found.")
+        sys.exit(1)
+
+    print("\nStarting PDF generation...")
+    for index, student_row in df_students.iterrows():
+        
+        student_name = student_row.get(STUDENT_NAME_COLUMN)
+        if pd.isna(student_name) or str(student_name).strip() == "":
+            student_name = f"Student_ID_{index}"
+            
+        print(f"Processing report for: {student_name}")
+        
+        safe_name = student_name.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "").replace("*", "")
+        pdf_file_name = f"Report - {safe_name}.pdf"
+        pdf_path = os.path.join(OUTPUT_FOLDER, pdf_file_name)
+        
+        # Pass the (possibly empty) answer_key_dict to the function
+        create_student_pdf(pdf_path, student_row, question_list, answer_key_dict)
+
+    print("\nAll reports generated successfully.")
+
+# --- Run the main function ---
+if __name__ == "__main__":
+    main()
